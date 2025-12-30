@@ -1,5 +1,7 @@
 from dotenv import load_dotenv
 
+from backend.models.product import Product
+
 # 优先加载环境变量
 load_dotenv()
 
@@ -9,8 +11,9 @@ from typing import List, Dict, Any
 from core.graphiti_adapter import GraphitiAdapter
 from core.vector_store import VectorManager
 from core.rag_engine import RAGEngine
-
-app = FastAPI(title="Multimodal KG Platform (GET/POST Only)")
+# backend/main.py 修改示例
+from backend.services.generic_service import GenericEntityService
+app = FastAPI(title="Multimodal KG Platform")
 
 # 初始化服务
 graph_adapter = GraphitiAdapter()
@@ -38,6 +41,76 @@ class UpdateStatusRequest(BaseModel):
 
 class DeleteRequest(BaseModel):
     image_id: str
+
+
+
+
+
+# ... 其他 imports
+
+# ----------------------------------------------------
+# 场景 1: 写入 User (用户)
+# ----------------------------------------------------
+@app.post("/api/users/ingest")
+async def ingest_users(users: List[Dict[str, Any]]):
+    """
+    User 写入示例
+    """
+    await GenericEntityService.ingest_entities(
+        data_list=users,
+        label="User",  # 存入 Neo4j 的 Label: :User
+        id_field="username",  # 主键字段名
+        vector_template="用户姓名: {name}, 职业: {job}, 兴趣: {hobby}"  # 向量化模版
+    )
+    return {"status": "success", "count": len(users)}
+
+
+# ----------------------------------------------------
+# 场景 2: 写入 Product (产品) - 替换原来的 ingest_product_batch
+# ----------------------------------------------------
+@app.post("/api/products/ingest")
+async def ingest_products(products: List[Product]):
+    """
+    接收符合 Product 模型结构的数据，并调用通用服务入库
+    """
+    try:
+        # 1. 数据转换：将 Pydantic 对象列表转换为 Dict 列表
+        # exclude_none=True 可以去除空值，避免覆盖旧数据的某些字段（视业务需求而定）
+        data_list = [p.model_dump(exclude_none=True) for p in products]
+
+        # 2. 调用通用服务
+        await GenericEntityService.ingest_entities(
+            data_list=data_list,
+            label="Product",  # 指定在 Neo4j 中的标签
+            id_field="code",  # 指定 Product 模型中的哪个字段是唯一主键
+            # 3. 定义向量化模版 (根据 Product 模型字段动态填充)
+            vector_template="产品编码: {code}, 系列: {series}, 功能: {fun}, 材质: {elem}, 描述: {className}"
+        )
+
+        return {
+            "status": "success",
+            "message": f"Successfully ingested {len(products)} products",
+            "sample_id": products[0].code if products else None
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ----------------------------------------------------
+# 场景 3: 通用查询 (Search)
+# ----------------------------------------------------
+@app.get("/api/search/{entity_type}")
+async def search_entity(entity_type: str, q: str):
+    """
+    通用搜索接口: /api/search/Product?q=... 或 /api/search/User?q=...
+    """
+    # entity_type 可以是 "Product" 或 "User"
+    # 注意首字母大写需与 ingest 时的 label 保持一致
+    result = await GenericEntityService.generic_search(
+        query=q,
+        target_label=entity_type
+    )
+    return result
 
 
 # --- API 路由 (纯 GET/POST) ---
@@ -84,7 +157,6 @@ async def get_entity(name: str):
 # URL 变更为 /update 结尾
 @app.post("/api/entities/{name}/update")
 async def update_entity(name: str, req: UpdateStatusRequest):
-
     try:
         result = graph_adapter.update_entity_status(name, req.new_status, req.timestamp)
         return {"status": "success", "data": result}
@@ -96,7 +168,6 @@ async def update_entity(name: str, req: UpdateStatusRequest):
 # URL 变更为 /delete 结尾，参数改为从 Body 或 Query 传
 @app.post("/api/observations/delete")
 async def delete_observation(req: DeleteRequest):
-
     try:
         graph_adapter.delete_observation_chain(req.image_id)
         return {"status": "success", "message": f"Deleted observation chain for {req.image_id}"}
@@ -117,4 +188,4 @@ async def chat(request: ChatRequest):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8077)
