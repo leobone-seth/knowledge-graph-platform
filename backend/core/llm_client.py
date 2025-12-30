@@ -1,5 +1,12 @@
 import json
-from graphiti_core import Graphiti
+import builtins
+
+if not hasattr(builtins, "AsyncOpenSearch"):
+    class AsyncOpenSearch:  # 占位类型，避免旧版 graphiti_core 中的类型注解报错
+        pass
+
+    builtins.AsyncOpenSearch = AsyncOpenSearch
+
 from graphiti_core.llm_client.config import LLMConfig
 from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
 from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig

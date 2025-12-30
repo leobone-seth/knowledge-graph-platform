@@ -20,8 +20,7 @@ class ChatService:
     _graph = Neo4jGraph(
         url=os.getenv("NEO4J_URI"),
         username=os.getenv("NEO4J_USERNAME"),
-        password=os.getenv("NEO4J_PASSWORD"),
-        refresh_schema=True
+        password=os.getenv("NEO4J_PASSWORD")
     )
 
     # 定义 Cypher 生成规则

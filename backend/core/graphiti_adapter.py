@@ -38,13 +38,15 @@ class GraphitiAdapter:
             SET s.status = entity.status
         )
         """
-        self.graph.query(cypher, params={
-            "image_id": image_id,
-            "timestamp": timestamp,
-            "summary": text_summary,
-            "entities": entities
-        })
-        self.graph.refresh_schema()
+        self.graph.query(
+            cypher,
+            params={
+                "image_id": image_id,
+                "timestamp": timestamp,
+                "summary": text_summary,
+                "entities": entities,
+            },
+        )
 
     # --- Read (查) ---
     def get_entity_details(self, name: str):
@@ -66,9 +68,10 @@ class GraphitiAdapter:
         SET e.current_status = $new_status, e.last_updated = $timestamp
         RETURN e
         """
-        self.graph.query(cypher, params={"name": name, "new_status": new_status, "timestamp": timestamp})
-        # 刷新 Schema 以便 LLM 感知新属性
-        self.graph.refresh_schema()
+        self.graph.query(
+            cypher,
+            params={"name": name, "new_status": new_status, "timestamp": timestamp},
+        )
         return {"name": name, "status": new_status, "updated_at": timestamp}
 
     # --- Delete (删) ---
@@ -80,5 +83,4 @@ class GraphitiAdapter:
         DETACH DELETE img, obs
         """
         self.graph.query(cypher, params={"image_id": image_id})
-        self.graph.refresh_schema()
         return True

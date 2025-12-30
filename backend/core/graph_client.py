@@ -1,4 +1,12 @@
 import os
+import builtins
+
+if not hasattr(builtins, "AsyncOpenSearch"):
+    class AsyncOpenSearch:  # 占位类型，避免旧版 graphiti_core 中的类型注解报错
+        pass
+
+    builtins.AsyncOpenSearch = AsyncOpenSearch
+
 from graphiti_core import Graphiti
 from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
 from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
