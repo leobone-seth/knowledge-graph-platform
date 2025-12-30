@@ -1,14 +1,15 @@
 import json
-import requests
 import os
 import time
 
+import requests
+
 # ================= 配置区域 =================
 # JSON 数据文件路径 (请确保文件存在于 scripts 目录下)
-JSON_FILE_PATH = os.path.join("scripts", "1218_json.json")
+JSON_FILE_PATH = "1218_json.json"
 
 # 后端 API 接口地址
-API_URL = "http://localhost:8000/api/products/ingest"
+API_URL = "http://localhost:8077/api/products/ingest"
 
 # 批处理大小 (每批发送多少条数据)
 # 建议设置在 50-100 之间，避免单次请求过大导致 HTTP 超时或数据库压力过大

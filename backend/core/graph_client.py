@@ -2,7 +2,7 @@ import os
 import builtins
 
 if not hasattr(builtins, "AsyncOpenSearch"):
-    class AsyncOpenSearch:  # 占位类型，避免旧版 graphiti_core 中的类型注解报错
+    class AsyncOpenSearch:
         pass
 
     builtins.AsyncOpenSearch = AsyncOpenSearch
@@ -10,25 +10,18 @@ if not hasattr(builtins, "AsyncOpenSearch"):
 from graphiti_core import Graphiti
 from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
 from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
-
-# LangChain 相关引用
 from langchain_community.vectorstores import Qdrant
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from qdrant_client import QdrantClient
-
-# 引用上面的 LLM Client
+from qdrant_client.http.models import Distance, VectorParams
 from backend.core.llm_client import SiliconFlowGenericClient, llm_config
 
-# 1. 环境变量读取
 NEO4J_URI = os.getenv("NEO4J_URI")
 NEO4J_USER = os.getenv("NEO4J_USERNAME")
 NEO4J_PWD = os.getenv("NEO4J_PASSWORD")
 QDRANT_URL = os.getenv("QDRANT_URL")
 EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "Qwen/Qwen3-Embedding-8B")
 
-# ==========================================
-# A. 初始化 Graphiti (用于入库写图)
-# ==========================================
 embed_config = OpenAIEmbedderConfig(
     api_key=os.getenv("OPENAI_API_KEY"),
     embedding_model=EMBEDDING_MODEL,
@@ -48,11 +41,6 @@ graphiti_app = Graphiti(
     cross_encoder=cross_encoder,
 )
 
-# ==========================================
-# B. 初始化 LangChain 组件 (用于查询)
-# ==========================================
-
-# 1. 标准 Chat LLM (用于 ChatService)
 langchain_llm = ChatOpenAI(
     model=os.getenv("OPENAI_API_MODEL"),
     openai_api_base=os.getenv("OPENAI_API_BASE"),
@@ -60,8 +48,19 @@ langchain_llm = ChatOpenAI(
     temperature=0
 )
 
-# 2. Vector Store (Qdrant)
 _qdrant_client = QdrantClient(url=QDRANT_URL)
+
+try:
+    _qdrant_client.get_collection("multimodal_knowledge")
+except Exception:
+    try:
+        _qdrant_client.create_collection(
+            collection_name="multimodal_knowledge",
+            vectors_config=VectorParams(size=4096, distance=Distance.COSINE),
+        )
+    except Exception as e:
+        print(f"Qdrant init error: {e}")
+
 langchain_embeddings = OpenAIEmbeddings(
     model=EMBEDDING_MODEL,
     openai_api_key=os.getenv("OPENAI_API_KEY"),
@@ -71,6 +70,6 @@ langchain_embeddings = OpenAIEmbeddings(
 
 vector_store = Qdrant(
     client=_qdrant_client,
-    collection_name="multimodal_knowledge", # 集合名称
+    collection_name="multimodal_knowledge",
     embeddings=langchain_embeddings,
 )
