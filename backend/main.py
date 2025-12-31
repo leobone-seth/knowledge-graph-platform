@@ -19,7 +19,13 @@ from backend.services.entity_service import GenericEntityService
 from backend.services.chat_service import ChatService
 from backend.entity_registry import ENTITY_SPECS, RULE_LINK_PRESETS
 import requests
+import os
+import logging
+import sys
+import time
 app = FastAPI(title="Multimodal KG Platform")
+
+logger = logging.getLogger("uvicorn.error")
 
 graph_adapter = GraphitiAdapter()
 vector_manager = VectorManager()
@@ -59,6 +65,10 @@ class CypherQueryRequest(BaseModel):
     params: Dict[str, Any] | None = None
 
 
+class ClearQdrantRequest(BaseModel):
+    collection_name: str = "multimodal_knowledge"
+
+
 class RuleLinkRequest(BaseModel):
     source_label: str
     source_id_field: str
@@ -77,6 +87,8 @@ class GenericIngestBody(BaseModel):
     concurrency: int = 5
     auto_link: bool = True
     score_threshold: float = 0.3
+    debug_match: bool = False
+    allow_unmatched: bool = False
 
 
 def _json_safe(data: Any) -> Any:
@@ -90,6 +102,8 @@ async def _ingest_by_entity_type(
         concurrency: int = 5,
         auto_link: bool = True,
         score_threshold: float = 0.3,
+        debug_match: bool = False,
+        allow_unmatched: bool = False,
 ):
     spec = ENTITY_SPECS.get(entity_type)
     if not spec:
@@ -127,9 +141,24 @@ async def _ingest_by_entity_type(
     skipped_unmatched = 0
     validated_data = validated_by_id
 
-    if spec.ingest_match_preset:
+    if spec.ingest_match_preset and not allow_unmatched:
         semaphore = asyncio.Semaphore(max(1, min(concurrency, 10)))
         kept: List[Dict[str, Any]] = []
+
+        debug_match = debug_match or (
+            os.getenv("DEBUG_INGEST_MATCH", "").strip().lower() in {"1", "true", "yes", "on"}
+        )
+        preset = RULE_LINK_PRESETS.get(spec.ingest_match_preset) or {}
+        debug_fields = {
+            "id_field": spec.id_field,
+            "id": None,
+            "preset": spec.ingest_match_preset,
+            "source_list_fields": preset.get("source_list_fields") or [],
+            "source_text_fields": preset.get("source_text_fields") or [],
+            "target_label": preset.get("target_label"),
+            "target_text_fields": preset.get("target_text_fields") or [],
+            "mode": preset.get("mode"),
+        }
 
         async def _check_and_keep(it: Dict[str, Any]):
             nonlocal skipped_unmatched
@@ -139,12 +168,43 @@ async def _ingest_by_entity_type(
                         spec.ingest_match_preset,
                         it,
                     )
+                    uid = it.get(spec.id_field)
+                    source_list_payload = {k: it.get(k) for k in (debug_fields["source_list_fields"] or [])}
+                    source_text_payload = {k: it.get(k) for k in (debug_fields["source_text_fields"] or [])}
+
+                    if debug_match:
+                        payload = {
+                            "id_field": debug_fields["id_field"],
+                            "id": uid,
+                            "preset": debug_fields["preset"],
+                            "mode": debug_fields["mode"],
+                            "source_list_fields": source_list_payload,
+                            "source_text_fields": source_text_payload,
+                            "target": {
+                                "label": debug_fields["target_label"],
+                                "text_fields": debug_fields["target_text_fields"],
+                            },
+                            "matched_count": matched_count,
+                        }
+                        logger.info("[DEBUG_INGEST_MATCH] %s", json.dumps(_json_safe(payload), ensure_ascii=False))
+
                     if matched_count > 0:
                         kept.append(it)
                     else:
                         skipped_unmatched += 1
+                        payload = {
+                            "entity_type": entity_type,
+                            "id_field": debug_fields["id_field"],
+                            "id": uid,
+                            "preset": debug_fields["preset"],
+                            "mode": debug_fields["mode"],
+                            "source_list_fields": source_list_payload,
+                            "source_text_fields": source_text_payload,
+                            "matched_count": matched_count,
+                        }
+                        logger.warning("[INGEST_UNMATCHED] %s", json.dumps(_json_safe(payload), ensure_ascii=False))
                 except Exception as e:
-                    print(f"Skipping unmatched item due to match check error: {e}")
+                    logger.exception("[INGEST_MATCH_ERROR] %s", str(e))
                     skipped_unmatched += 1
 
         await asyncio.gather(*[_check_and_keep(it) for it in validated_by_id])
@@ -164,7 +224,7 @@ async def _ingest_by_entity_type(
             },
         }
 
-    await GenericEntityService.ingest_entities(
+    ingest_summary = await GenericEntityService.ingest_entities(
         data_list=validated_data,
         label=spec.label,
         id_field=spec.id_field,
@@ -175,15 +235,43 @@ async def _ingest_by_entity_type(
     )
 
     if auto_link and entity_type == "StandardDocument":
-        asyncio.create_task(
-            GenericEntityService.link_entities_by_semantic(
-                source_label="StandardDocument",
-                source_id_field=ENTITY_SPECS["StandardDocument"].id_field,
-                target_label="Product",
-                target_id_field=ENTITY_SPECS["Product"].id_field,
-                score_threshold=score_threshold
+        try:
+            neo4j_written = int((ingest_summary or {}).get("neo4j_written") or 0)
+        except Exception:
+            neo4j_written = 0
+        if neo4j_written <= 0:
+            print(
+                "[STD_LINK_SKIP] reason=neo4j_write_failed_or_zero",
+                "ingested=", len(validated_data),
+                "neo4j_written=", neo4j_written,
+                flush=True,
             )
-        )
+            return {
+                "status": "success",
+                "entity_type": entity_type,
+                "message": "Entities ingested, linking skipped because Neo4j write failed.",
+                "received": received_count,
+                "parsed": parsed_count,
+                "ingested": len(validated_data),
+                "ingest_summary": _json_safe(ingest_summary),
+                "skipped": {
+                    "parse_invalid": skipped_parse_invalid,
+                    "missing_id": skipped_missing_id,
+                    "unmatched": skipped_unmatched,
+                },
+            }
+        preset_name = ENTITY_SPECS["StandardDocument"].ingest_match_preset
+        if preset_name:
+            ids = [it.get(ENTITY_SPECS["StandardDocument"].id_field) for it in validated_data]
+            ids = [i for i in ids if i]
+            if ids:
+                asyncio.create_task(
+                    GenericEntityService.link_rule_preset_for_sources(
+                        preset_name=preset_name,
+                        source_ids=ids,
+                        sample_limit=0,
+                    )
+                )
         return {
             "status": "success",
             "entity_type": entity_type,
@@ -191,6 +279,7 @@ async def _ingest_by_entity_type(
             "received": received_count,
             "parsed": parsed_count,
             "ingested": len(validated_data),
+            "ingest_summary": _json_safe(ingest_summary),
             "skipped": {
                 "parse_invalid": skipped_parse_invalid,
                 "missing_id": skipped_missing_id,
@@ -204,6 +293,7 @@ async def _ingest_by_entity_type(
         "received": received_count,
         "parsed": parsed_count,
         "ingested": len(validated_data),
+        "ingest_summary": _json_safe(ingest_summary),
         "skipped": {
             "parse_invalid": skipped_parse_invalid,
             "missing_id": skipped_missing_id,
@@ -238,6 +328,9 @@ async def list_entity_types():
 
 @app.post("/api/entities/{entity_type}/ingest")
 async def ingest_entity_generic(entity_type: str, body: GenericIngestBody):
+    force_standard_write = entity_type == "StandardDocument" and (
+        os.getenv("FORCE_STANDARD_WRITE", "1").strip().lower() in {"1", "true", "yes", "on"}
+    )
     return await _ingest_by_entity_type(
         entity_type=entity_type,
         items=body.items,
@@ -245,6 +338,8 @@ async def ingest_entity_generic(entity_type: str, body: GenericIngestBody):
         concurrency=body.concurrency,
         auto_link=body.auto_link,
         score_threshold=body.score_threshold,
+        debug_match=body.debug_match,
+        allow_unmatched=body.allow_unmatched or force_standard_write,
     )
 
 
@@ -299,7 +394,176 @@ async def ingest_standards(standards: List[Dict[str, Any]]):
         concurrency=5,
         auto_link=True,
         score_threshold=0.3,
+        allow_unmatched=True,
     )
+
+
+@app.get("/api/debug/standards/count")
+async def debug_standards_count():
+    cypher = """
+    MATCH (s:StandardDocument)
+    RETURN count(s) as cnt
+    """
+    async with graphiti_app.driver.session() as session:
+        result = await session.run(cypher)
+        record = await result.single()
+        cnt_val = record.get("cnt") if record else None
+        cnt = int(cnt_val) if cnt_val is not None else 0
+    return {"label": "StandardDocument", "count": cnt}
+
+
+@app.get("/api/debug/standards/links")
+async def debug_standard_links(standard_code: str | None = None, limit: int = 20, recent: int = 20):
+    sc = (standard_code or "").strip()
+    limit = max(0, min(int(limit), 100))
+    recent = max(0, min(int(recent), 200))
+
+    if not sc:
+        list_cypher = """
+        MATCH (s:StandardDocument)
+        OPTIONAL MATCH (s)-[:APPLIES_TO]->(p:Product)
+        WITH s, count(p) as edge_count
+        ORDER BY s.last_updated DESC
+        RETURN s.standard_code as standard_code, edge_count as edge_count
+        LIMIT $recent
+        """
+        async with graphiti_app.driver.session() as session:
+            res = await session.run(list_cypher, recent=recent)
+            rows = await res.data()
+            await res.consume()
+        return {
+            "status": "missing_standard_code",
+            "usage": "/api/debug/standards/links?standard_code=FZ/T%2073018-2021&limit=50",
+            "recent": _json_safe(rows),
+        }
+
+    count_cypher = """
+    MATCH (s:StandardDocument {standard_code: $standard_code})-[:APPLIES_TO]->(p:Product)
+    RETURN count(p) as cnt
+    """
+    sample_cypher = """
+    MATCH (s:StandardDocument {standard_code: $standard_code})-[:APPLIES_TO]->(p:Product)
+    RETURN p.code as code, p.series as series, p.className as className, p.elem as elem, p.fun as fun
+    LIMIT $limit
+    """
+    async with graphiti_app.driver.session() as session:
+        count_res = await session.run(count_cypher, standard_code=sc)
+        count_rec = await count_res.single()
+        cnt_val = count_rec.get("cnt") if count_rec else None
+        cnt = int(cnt_val) if cnt_val is not None else 0
+        await count_res.consume()
+
+        sample_res = await session.run(sample_cypher, standard_code=sc, limit=limit)
+        rows = await sample_res.data()
+        await sample_res.consume()
+
+    return {"standard_code": sc, "edge_count": cnt, "products": _json_safe(rows)}
+
+
+@app.get("/api/debug/products/match_count")
+async def debug_products_match_count(keyword: str = "羊毛"):
+    kw = (keyword or "").strip()
+    cypher = """
+    MATCH (p:Product)
+    WHERE
+        coalesce(toString(p.elem), '') CONTAINS $keyword
+        OR coalesce(toString(p.fun), '') CONTAINS $keyword
+        OR coalesce(toString(p.className), '') CONTAINS $keyword
+        OR coalesce(toString(p.series), '') CONTAINS $keyword
+    RETURN count(p) as matched_count
+    """
+    async with graphiti_app.driver.session() as session:
+        result = await session.run(cypher, keyword=kw)
+        record = await result.single()
+        matched_val = record.get("matched_count") if record else None
+        matched_count = int(matched_val) if matched_val is not None else 0
+    logger.info("[DEBUG_PRODUCTS_MATCH_COUNT] keyword=%s matched_count=%s", kw, matched_count)
+    return {"keyword": kw, "matched_count": matched_count, "cypher": cypher.strip()}
+
+
+@app.get("/api/debug/neo4j/env")
+async def debug_neo4j_env():
+    uri = os.getenv("NEO4J_URI")
+    user = os.getenv("NEO4J_USERNAME")
+    connectivity: Dict[str, Any] = {"ok": False}
+    server: Dict[str, Any] | None = None
+    current_user: Dict[str, Any] | None = None
+    current_db: Dict[str, Any] | None = None
+
+    try:
+        async with graphiti_app.driver.session() as session:
+            ping_res = await session.run("RETURN 1 as ok")
+            await ping_res.consume()
+            connectivity = {"ok": True}
+
+            try:
+                db_res = await session.run("SHOW CURRENT DATABASE YIELD name RETURN name")
+                db_rec = await db_res.single()
+                await db_res.consume()
+                if db_rec and "name" in db_rec:
+                    current_db = {"name": db_rec["name"]}
+            except Exception:
+                current_db = None
+
+            comp_res = await session.run(
+                "CALL dbms.components() YIELD name, versions, edition RETURN name, versions[0] as version, edition"
+            )
+            comp = await comp_res.single()
+            if comp:
+                server = {
+                    "name": comp.get("name"),
+                    "version": comp.get("version"),
+                    "edition": comp.get("edition"),
+                }
+
+            try:
+                user_res = await session.run("SHOW CURRENT USER YIELD user RETURN user")
+                user_rec = await user_res.single()
+                if user_rec and "user" in user_rec:
+                    current_user = {"user": user_rec["user"]}
+            except Exception:
+                current_user = None
+    except Exception as e:
+        connectivity = {"ok": False, "error": str(e)}
+
+    return {
+        "neo4j_uri": uri,
+        "neo4j_username": user,
+        "connectivity": connectivity,
+        "current_database": current_db,
+        "server": server,
+        "current_user": current_user,
+    }
+
+
+@app.get("/api/debug/runtime")
+async def debug_runtime():
+    now = time.time()
+    def _stat(path: str) -> Dict[str, Any] | None:
+        try:
+            st = os.stat(path)
+            return {"mtime": st.st_mtime, "age_sec": round(now - st.st_mtime, 3)}
+        except Exception:
+            return None
+
+    root = os.getcwd()
+    main_path = os.path.abspath(__file__)
+    svc_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "services", "entity_service.py"))
+
+    return {
+        "pid": os.getpid(),
+        "python": sys.version,
+        "cwd": root,
+        "files": {
+            "main.py": {"path": main_path, "stat": _stat(main_path)},
+            "entity_service.py": {"path": svc_path, "stat": _stat(svc_path)},
+        },
+        "env": {
+            "NEO4J_URI": os.getenv("NEO4J_URI"),
+            "NEO4J_USERNAME": os.getenv("NEO4J_USERNAME"),
+            "FORCE_STANDARD_WRITE": os.getenv("FORCE_STANDARD_WRITE", "1"),
+        },
+    }
 # ----------------------------------------------------
 # 场景 3: 通用查询 (Search)
 # ----------------------------------------------------
@@ -437,6 +701,36 @@ async def run_linking_preset(preset_name: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/linking/presets/{preset_name}/run_one")
+async def run_linking_preset_for_one(
+        preset_name: str,
+        source_id: str,
+        sample_limit: int = 10,
+        keyword: str | None = None,
+):
+    try:
+        return await GenericEntityService.link_rule_preset_for_source(
+            preset_name=preset_name,
+            source_id=source_id,
+            sample_limit=sample_limit,
+            keyword=keyword,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/linking/presets/{preset_name}/repair_one")
+async def repair_linking_preset_for_one(preset_name: str, source_id: str, sample_limit: int = 10):
+    try:
+        return await GenericEntityService.repair_rule_preset_for_source(
+            preset_name=preset_name,
+            source_id=source_id,
+            sample_limit=sample_limit,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/api/linking/rules/run")
 async def run_linking_rules(req: RuleLinkRequest):
     try:
@@ -482,7 +776,8 @@ async def verify_neo4j_relationships(
         async with graphiti_app.driver.session() as session:
             count_res = await session.run(count_cypher)
             count_rec = await count_res.single()
-            edge_count = int(count_rec["edge_count"]) if count_rec else 0
+            edge_val = count_rec.get("edge_count") if count_rec else None
+            edge_count = int(edge_val) if edge_val is not None else 0
 
             sample_res = await session.run(sample_cypher, limit=limit)
             samples = await sample_res.data()
@@ -507,6 +802,22 @@ async def verify_qdrant_points_count(entity_label: str, group_id: str | None = N
         resp.raise_for_status()
         data = resp.json()
         return {"count": data.get("result", {}).get("count", 0), "note": "Qdrant仅保存向量点，不保存Neo4j的边"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/admin/qdrant/collections/clear")
+async def clear_qdrant_collection(req: ClearQdrantRequest):
+    try:
+        resp = requests.post(
+            f"{QDRANT_URL}/collections/{req.collection_name}/points/delete",
+            json={"filter": {}},
+            params={"wait": "true"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return {"status": "success", "result": data}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

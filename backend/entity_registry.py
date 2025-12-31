@@ -37,7 +37,7 @@ RULE_LINK_PRESETS: Dict[str, Dict[str, Any]] = {
         "rel_type": "APPLIES_TO",
         "source_list_fields": ["tags"],
         "source_text_fields": ["title", "summary"],
-        "target_text_fields": ["elem", "fun", "className", "series"],
+        "target_text_fields": ["elem"],
         "mode": "contains_any",
     },
     "sensory_to_product": {

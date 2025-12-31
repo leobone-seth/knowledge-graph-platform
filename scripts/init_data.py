@@ -9,7 +9,7 @@ import requests
 JSON_FILE_PATH = "1218_json.json"
 
 # 后端 API 接口地址
-API_URL = "http://localhost:8077/api/products/ingest"
+API_URL = "http://localhost:8077/api/entities/Product/ingest"
 
 # 批处理大小 (每批发送多少条数据)
 # 建议设置在 50-100 之间，避免单次请求过大导致 HTTP 超时或数据库压力过大
@@ -83,7 +83,17 @@ def init_data():
 
         try:
             # 发送 POST 请求
-            response = requests.post(API_URL, json=batch_data, headers=headers)
+            response = requests.post(
+                API_URL,
+                json={
+                    "items": batch_data,
+                    "group_id": "default",
+                    "concurrency": 5,
+                    "auto_link": False,
+                    "score_threshold": 0.3,
+                },
+                headers=headers,
+            )
 
             # 5. 处理并打印响应
             if response.status_code == 200:
