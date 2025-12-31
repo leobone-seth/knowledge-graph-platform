@@ -15,8 +15,9 @@ from core.graphiti_adapter import GraphitiAdapter
 from core.vector_store import VectorManager
 from core.rag_engine import RAGEngine
 from backend.core.graph_client import QDRANT_URL, graphiti_app
-from backend.services.generic_service import GenericEntityService
+from backend.services.entity_service import GenericEntityService
 from backend.services.chat_service import ChatService
+from backend.entity_registry import ENTITY_SPECS, RULE_LINK_PRESETS
 import requests
 app = FastAPI(title="Multimodal KG Platform")
 
@@ -70,8 +71,145 @@ class RuleLinkRequest(BaseModel):
     mode: str = "contains_any"
 
 
+class GenericIngestBody(BaseModel):
+    items: List[Dict[str, Any]]
+    group_id: str = "default"
+    concurrency: int = 5
+    auto_link: bool = True
+    score_threshold: float = 0.3
+
+
 def _json_safe(data: Any) -> Any:
     return json.loads(json.dumps(data, ensure_ascii=False, default=str))
+
+
+async def _ingest_by_entity_type(
+        entity_type: str,
+        items: List[Dict[str, Any]],
+        group_id: str = "default",
+        concurrency: int = 5,
+        auto_link: bool = True,
+        score_threshold: float = 0.3,
+):
+    spec = ENTITY_SPECS.get(entity_type)
+    if not spec:
+        raise HTTPException(status_code=400, detail=f"Unknown entity_type: {entity_type}")
+
+    received_count = len(items)
+    parsed_count = received_count
+    skipped_parse_invalid = 0
+
+    if entity_type == "StandardDocument":
+        cleaned_data = []
+        for item in items:
+            try:
+                doc_obj = StandardDocument.from_chinese_json(item)
+                cleaned_data.append(doc_obj.model_dump(exclude_none=True))
+            except Exception as e:
+                print(f"Skipping invalid standard: {e}")
+                skipped_parse_invalid += 1
+        if not cleaned_data:
+            return {"status": "error", "message": "No valid data parsed"}
+        data_list = cleaned_data
+        parsed_count = len(cleaned_data)
+    else:
+        data_list = items
+
+    skipped_missing_id = 0
+    validated_by_id: List[Dict[str, Any]] = []
+    for item in data_list:
+        uid = item.get(spec.id_field)
+        if uid is None or (isinstance(uid, str) and not uid.strip()):
+            skipped_missing_id += 1
+            continue
+        validated_by_id.append(item)
+
+    skipped_unmatched = 0
+    validated_data = validated_by_id
+
+    if spec.ingest_match_preset:
+        semaphore = asyncio.Semaphore(max(1, min(concurrency, 10)))
+        kept: List[Dict[str, Any]] = []
+
+        async def _check_and_keep(it: Dict[str, Any]):
+            nonlocal skipped_unmatched
+            async with semaphore:
+                try:
+                    matched_count = await GenericEntityService.count_rule_matches_for_item(
+                        spec.ingest_match_preset,
+                        it,
+                    )
+                    if matched_count > 0:
+                        kept.append(it)
+                    else:
+                        skipped_unmatched += 1
+                except Exception as e:
+                    print(f"Skipping unmatched item due to match check error: {e}")
+                    skipped_unmatched += 1
+
+        await asyncio.gather(*[_check_and_keep(it) for it in validated_by_id])
+        validated_data = kept
+
+    if not validated_data:
+        return {
+            "status": "success",
+            "entity_type": entity_type,
+            "received": received_count,
+            "parsed": parsed_count,
+            "ingested": 0,
+            "skipped": {
+                "parse_invalid": skipped_parse_invalid,
+                "missing_id": skipped_missing_id,
+                "unmatched": skipped_unmatched,
+            },
+        }
+
+    await GenericEntityService.ingest_entities(
+        data_list=validated_data,
+        label=spec.label,
+        id_field=spec.id_field,
+        vector_template=spec.vector_template,
+        graph_exclude_fields=spec.graph_exclude_fields,
+        group_id=group_id,
+        concurrency=concurrency,
+    )
+
+    if auto_link and entity_type == "StandardDocument":
+        asyncio.create_task(
+            GenericEntityService.link_entities_by_semantic(
+                source_label="StandardDocument",
+                source_id_field=ENTITY_SPECS["StandardDocument"].id_field,
+                target_label="Product",
+                target_id_field=ENTITY_SPECS["Product"].id_field,
+                score_threshold=score_threshold
+            )
+        )
+        return {
+            "status": "success",
+            "entity_type": entity_type,
+            "message": "Entities ingested, linking task started in background.",
+            "received": received_count,
+            "parsed": parsed_count,
+            "ingested": len(validated_data),
+            "skipped": {
+                "parse_invalid": skipped_parse_invalid,
+                "missing_id": skipped_missing_id,
+                "unmatched": skipped_unmatched,
+            },
+        }
+
+    return {
+        "status": "success",
+        "entity_type": entity_type,
+        "received": received_count,
+        "parsed": parsed_count,
+        "ingested": len(validated_data),
+        "skipped": {
+            "parse_invalid": skipped_parse_invalid,
+            "missing_id": skipped_missing_id,
+            "unmatched": skipped_unmatched,
+        },
+    }
 
 
 
@@ -93,6 +231,22 @@ async def ingest_users(users: List[Dict[str, Any]]):
     )
     return {"status": "success", "count": len(users)}
 
+@app.get("/api/entities/types")
+async def list_entity_types():
+    return {"entity_types": sorted(list(ENTITY_SPECS.keys()))}
+
+
+@app.post("/api/entities/{entity_type}/ingest")
+async def ingest_entity_generic(entity_type: str, body: GenericIngestBody):
+    return await _ingest_by_entity_type(
+        entity_type=entity_type,
+        items=body.items,
+        group_id=body.group_id,
+        concurrency=body.concurrency,
+        auto_link=body.auto_link,
+        score_threshold=body.score_threshold,
+    )
+
 
 # ----------------------------------------------------
 # 场景 2: 写入 Product (产品) - 替换原来的 ingest_product_batch
@@ -108,12 +262,12 @@ async def ingest_products(products: List[Product]):
         data_list = [p.model_dump(exclude_none=True) for p in products]
 
         # 2. 调用通用服务
-        await GenericEntityService.ingest_entities(
-            data_list=data_list,
-            label="Product",  # 指定在 Neo4j 中的标签
-            id_field="code",  # 指定 Product 模型中的哪个字段是唯一主键
-            # 3. 定义向量化模版 (根据 Product 模型字段动态填充)
-            vector_template="产品编码: {code}, 系列: {series}, 功能: {fun}, 材质: {elem}, 描述: {className}"
+        await _ingest_by_entity_type(
+            entity_type="Product",
+            items=data_list,
+            group_id="default",
+            concurrency=5,
+            auto_link=False,
         )
 
         return {
@@ -138,43 +292,14 @@ async def ingest_standards(standards: List[Dict[str, Any]]):
     """
     摄入标准文档，并自动与 Product 建立关联
     """
-    # 1. 使用 StandardDocument 模型清洗数据 (利用你已有的 from_chinese_json)
-    cleaned_data = []
-    for item in standards:
-        try:
-            doc_obj = StandardDocument.from_chinese_json(item)
-            cleaned_data.append(doc_obj.model_dump(exclude_none=True))
-        except Exception as e:
-            print(f"Skipping invalid standard: {e}")
-
-    if not cleaned_data:
-        return {"status": "error", "message": "No valid data parsed"}
-
-    # 2. 调用通用入库 (写入 Neo4j 和 Qdrant)
-    # 这里的 vector_template 很重要，决定了能搜到什么样的产品
-    # 例如：把“针织”、“长袖”等关键词放进去
-    await GenericEntityService.ingest_entities(
-        data_list=cleaned_data,
-        label="StandardDocument",
-        id_field="standard_code",
-        vector_template="标题: {title}, 摘要: {summary}, 标签: {tags}, 内容: {main_content}",
-        graph_exclude_fields=["main_content"] # 正文太长，不存 Neo4j 属性，只存向量
+    return await _ingest_by_entity_type(
+        entity_type="StandardDocument",
+        items=standards,
+        group_id="default",
+        concurrency=5,
+        auto_link=True,
+        score_threshold=0.3,
     )
-
-    # 3. [关键步骤] 触发语义关联
-    # 让系统自动把 "StandardDocument" 和 "Product" 连起来
-    # 注意：在后台运行，不要阻塞 HTTP 返回
-    asyncio.create_task(
-        GenericEntityService.link_entities_by_semantic(
-            source_label="StandardDocument",
-            source_id_field="standard_code",
-            target_label="Product",
-            target_id_field="code",
-            score_threshold=0.3    # 设定一个较高的匹配门槛
-        )
-    )
-
-    return {"status": "success", "message": "Standards ingested, linking task started in background."}
 # ----------------------------------------------------
 # 场景 3: 通用查询 (Search)
 # ----------------------------------------------------
@@ -301,7 +426,7 @@ async def run_cypher_query(req: CypherQueryRequest):
 
 @app.get("/api/linking/presets")
 async def list_linking_presets():
-    return {"presets": list(GenericEntityService.RULE_LINK_PRESETS.keys())}
+    return {"presets": list(RULE_LINK_PRESETS.keys())}
 
 
 @app.post("/api/linking/presets/{preset_name}/run")
