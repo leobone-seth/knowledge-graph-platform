@@ -19,7 +19,11 @@ from backend.core.llm_client import SiliconFlowGenericClient, llm_config
 NEO4J_URI = os.getenv("NEO4J_URI")
 NEO4J_USER = os.getenv("NEO4J_USERNAME")
 NEO4J_PWD = os.getenv("NEO4J_PASSWORD")
-QDRANT_URL = os.getenv("QDRANT_URL")
+
+_raw_qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
+if _raw_qdrant_url and not _raw_qdrant_url.startswith("http"):
+    _raw_qdrant_url = "http://" + _raw_qdrant_url
+QDRANT_URL = _raw_qdrant_url
 EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "Qwen/Qwen3-Embedding-8B")
 
 embed_config = OpenAIEmbedderConfig(

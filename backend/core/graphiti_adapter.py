@@ -84,3 +84,6 @@ class GraphitiAdapter:
         """
         self.graph.query(cypher, params={"image_id": image_id})
         return True
+
+    def run_cypher(self, cypher: str, params: dict | None = None):
+        return self.graph.query(cypher, params=params or {})

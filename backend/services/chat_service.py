@@ -29,8 +29,10 @@ class ChatService:
         Task: Generate Cypher query for Neo4j.
         Schema: {schema}
         Instructions:
-        1. Nodes: `Product`, `ProductAttr`.
-        2. Edge: (Product)-[:HAS_ATTR]->(ProductAttr).
+        1. Nodes: `Product`, `ProductAttr`, `StandardDocument`.
+        2. Edge: 
+           - (Product)-[:HAS_ATTR]->(ProductAttr)
+           - (StandardDocument)-[:APPLIES_TO]->(Product) 
         3. Do NOT query `Observation` or `Episode`.
         4. For aggregation/counting, use count().
         5. For string matching, use CONTAINS.
@@ -69,13 +71,13 @@ class ChatService:
                     "属性": item["graph_data"],
                     "描述": item["semantic_text"][:100]
                 }
-                context_str += f"- {json.dumps(info, ensure_ascii=False)}\n"
+                context_str += f"- {json.dumps(info, ensure_ascii=False, default=str)}\n"
         else:
             context_str += "(无相关结果)\n"
 
         context_str += "\n【来源2：全库统计 (Neo4j Cypher)】\n"
         if graph_res:
-            context_str += f"{json.dumps(graph_res, ensure_ascii=False)}\n"
+            context_str += f"{json.dumps(graph_res, ensure_ascii=False, default=str)}\n"
         else:
             context_str += "(无统计数据)\n"
 
