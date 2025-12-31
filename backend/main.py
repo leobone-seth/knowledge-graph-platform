@@ -12,7 +12,6 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Dict, Any
 from core.graphiti_adapter import GraphitiAdapter
-from core.vector_store import VectorManager
 from core.rag_engine import RAGEngine
 from backend.core.graph_client import QDRANT_URL, graphiti_app
 from backend.services.entity_service import GenericEntityService
@@ -28,29 +27,12 @@ app = FastAPI(title="Multimodal KG Platform")
 logger = logging.getLogger("uvicorn.error")
 
 graph_adapter = GraphitiAdapter()
-vector_manager = VectorManager()
 rag_engine = RAGEngine()
 
 
 # --- 请求模型 ---
-class IngestRequest(BaseModel):
-    image_id: str
-    timestamp: str
-    summary_text: str
-    objects: List[Dict[str, Any]]
-
-
 class ChatRequest(BaseModel):
     question: str
-
-
-class UpdateStatusRequest(BaseModel):
-    new_status: str
-    timestamp: str
-
-
-class DeleteRequest(BaseModel):
-    image_id: str
 
 
 
@@ -323,11 +305,17 @@ async def ingest_users(users: List[Dict[str, Any]]):
 
 @app.get("/api/entities/types")
 async def list_entity_types():
+    """
+    返回当前服务中注册的实体类型列表，便于前端做下拉选择
+    """
     return {"entity_types": sorted(list(ENTITY_SPECS.keys()))}
 
 
 @app.post("/api/entities/{entity_type}/ingest")
 async def ingest_entity_generic(entity_type: str, body: GenericIngestBody):
+    """
+    通用实体写入入口，根据 entity_type 自动路由到对应的配置
+    """
     force_standard_write = entity_type == "StandardDocument" and (
         os.getenv("FORCE_STANDARD_WRITE", "1").strip().lower() in {"1", "true", "yes", "on"}
     )
@@ -400,6 +388,9 @@ async def ingest_standards(standards: List[Dict[str, Any]]):
 
 @app.get("/api/debug/standards/count")
 async def debug_standards_count():
+    """
+    调试用：统计标准文档节点总数，验证写入是否成功
+    """
     cypher = """
     MATCH (s:StandardDocument)
     RETURN count(s) as cnt
@@ -414,6 +405,9 @@ async def debug_standards_count():
 
 @app.get("/api/debug/standards/links")
 async def debug_standard_links(standard_code: str | None = None, limit: int = 20, recent: int = 20):
+    """
+    调试用：查看某个标准与 Product 的关联情况，或最近更新的若干标准
+    """
     sc = (standard_code or "").strip()
     limit = max(0, min(int(limit), 100))
     recent = max(0, min(int(recent), 200))
@@ -462,6 +456,9 @@ async def debug_standard_links(standard_code: str | None = None, limit: int = 20
 
 @app.get("/api/debug/products/match_count")
 async def debug_products_match_count(keyword: str = "羊毛"):
+    """
+    调试用：根据关键字统计命中的 Product 数量，用于观察匹配范围
+    """
     kw = (keyword or "").strip()
     cypher = """
     MATCH (p:Product)
@@ -483,6 +480,9 @@ async def debug_products_match_count(keyword: str = "羊毛"):
 
 @app.get("/api/debug/neo4j/env")
 async def debug_neo4j_env():
+    """
+    调试用：检查 Neo4j 连接状态、当前数据库与用户等基础信息
+    """
     uri = os.getenv("NEO4J_URI")
     user = os.getenv("NEO4J_USERNAME")
     connectivity: Dict[str, Any] = {"ok": False}
@@ -538,6 +538,9 @@ async def debug_neo4j_env():
 
 @app.get("/api/debug/runtime")
 async def debug_runtime():
+    """
+    调试用：查看后端运行环境、关键文件的更新时间等信息
+    """
     now = time.time()
     def _stat(path: str) -> Dict[str, Any] | None:
         try:
@@ -581,70 +584,11 @@ async def search_entity(entity_type: str, q: str):
     return result
 
 
-# --- API 路由 (纯 GET/POST) ---
-
-# 1. CREATE -> POST (保持不变)
-@app.post("/api/ingest")
-async def ingest_data(data: IngestRequest):
-    """
-    [新增数据]
-    """
-    try:
-        graph_adapter.add_observation(
-            image_id=data.image_id,
-            timestamp=data.timestamp,
-            text_summary=data.summary_text,
-            entities=data.objects
-        )
-        try:
-            vector_manager.add_text(
-                text=data.summary_text,
-                metadata={"image_id": data.image_id, "timestamp": data.timestamp}
-            )
-        except Exception as v_e:
-            print(f"Vector store warning: {v_e}")
-
-        return {"status": "success", "message": f"Ingested {data.image_id}"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# 2. READ -> GET (保持不变)
-@app.get("/api/entities/{name}")
-async def get_entity(name: str):
-    """
-    [查询实体]
-    """
-    data = graph_adapter.get_entity_details(name)
-    if not data:
-        raise HTTPException(status_code=404, detail="Entity not found")
-    return {"data": data}
-
-
-# 3. UPDATE -> POST (原 PUT)
-# URL 变更为 /update 结尾
-@app.post("/api/entities/{name}/update")
-async def update_entity(name: str, req: UpdateStatusRequest):
-    try:
-        result = graph_adapter.update_entity_status(name, req.new_status, req.timestamp)
-        return {"status": "success", "data": result}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# 4. DELETE -> POST (原 DELETE)
-# URL 变更为 /delete 结尾，参数改为从 Body 或 Query 传
-@app.post("/api/observations/delete")
-async def delete_observation(req: DeleteRequest):
-    try:
-        graph_adapter.delete_observation_chain(req.image_id)
-        return {"status": "success", "message": f"Deleted observation chain for {req.image_id}"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 @app.post("/api/del/entities/delete")
 async def delete_entity_by_id(req: EntityDeleteRequest):
+    """
+    根据 label + 主键字段 + 主键值 删除单个实体节点
+    """
     try:
         deleted = await GenericEntityService.delete_entity(
             label=req.label,
@@ -663,24 +607,36 @@ async def delete_entity_by_id(req: EntityDeleteRequest):
 # 5. RAG Chat -> POST (保持不变)
 @app.post("/api/chat")
 async def chat(request: ChatRequest):
+    """
+    默认高精度聊天模式，内部走混合检索 + 复杂推理链路
+    """
     result = await ChatService.run_deep_accuracy_chat(request.question)
     return result
 
 
 @app.post("/api/chat/simple")
 async def chat_simple(request: ChatRequest):
+    """
+    简单聊天模式，直接调用向量检索 + 轻量回答
+    """
     answer = rag_engine.query(request.question)
     return {"answer": answer}
 
 
 @app.post("/api/chat/deep")
 async def chat_deep(request: ChatRequest):
+    """
+    显式调用深度聊天模式，与 /api/chat 行为一致
+    """
     result = await ChatService.run_deep_accuracy_chat(request.question)
     return result
 
 
 @app.post("/api/graph/query")
 async def run_cypher_query(req: CypherQueryRequest):
+    """
+    运行原始 Cypher 查询（谨慎开放，通常只给内部调试使用）
+    """
     try:
         result = graph_adapter.run_cypher(req.cypher, req.params or {})
         return {"data": result}
@@ -690,11 +646,17 @@ async def run_cypher_query(req: CypherQueryRequest):
 
 @app.get("/api/linking/presets")
 async def list_linking_presets():
+    """
+    列出可用的规则联动预设名称，前端可以用来做下拉选择
+    """
     return {"presets": list(RULE_LINK_PRESETS.keys())}
 
 
 @app.post("/api/linking/presets/{preset_name}/run")
 async def run_linking_preset(preset_name: str):
+    """
+    按预设名称运行整库规则联动任务（通常是批量离线任务）
+    """
     try:
         return await GenericEntityService.run_rule_preset(preset_name)
     except Exception as e:
@@ -708,6 +670,9 @@ async def run_linking_preset_for_one(
         sample_limit: int = 10,
         keyword: str | None = None,
 ):
+    """
+    对单个 source 节点运行规则联动，可选传入 keyword 做强化匹配
+    """
     try:
         return await GenericEntityService.link_rule_preset_for_source(
             preset_name=preset_name,
@@ -721,6 +686,9 @@ async def run_linking_preset_for_one(
 
 @app.post("/api/linking/presets/{preset_name}/repair_one")
 async def repair_linking_preset_for_one(preset_name: str, source_id: str, sample_limit: int = 10):
+    """
+    修复单个 source 的联动结果，常用于某条数据修正后的重跑
+    """
     try:
         return await GenericEntityService.repair_rule_preset_for_source(
             preset_name=preset_name,
@@ -733,6 +701,9 @@ async def repair_linking_preset_for_one(preset_name: str, source_id: str, sample
 
 @app.post("/api/linking/rules/run")
 async def run_linking_rules(req: RuleLinkRequest):
+    """
+    自定义规则联动入口，前端可以动态指定源/目标/字段/关系类型
+    """
     try:
         edges = await GenericEntityService.link_entities_by_rules(
             source_label=req.source_label,
@@ -757,6 +728,9 @@ async def verify_neo4j_relationships(
         rel_type: str,
         limit: int = 10,
 ):
+    """
+    校验 Neo4j 中某类关系的数量，并抽样返回若干边的两端节点
+    """
     try:
         src_lbl = GenericEntityService._validate_cypher_identifier(source_label)
         tgt_lbl = GenericEntityService._validate_cypher_identifier(target_label)
@@ -789,6 +763,9 @@ async def verify_neo4j_relationships(
 
 @app.get("/api/verify/qdrant/points/count")
 async def verify_qdrant_points_count(entity_label: str, group_id: str | None = None):
+    """
+    校验 Qdrant 中某实体类型（及可选 group_id）的向量点数量
+    """
     try:
         must = [{"key": "metadata.entity_label", "match": {"value": entity_label}}]
         if group_id:
@@ -808,6 +785,9 @@ async def verify_qdrant_points_count(entity_label: str, group_id: str | None = N
 
 @app.post("/api/admin/qdrant/collections/clear")
 async def clear_qdrant_collection(req: ClearQdrantRequest):
+    """
+    管理接口：清空指定 collection 中的所有向量点，慎用
+    """
     try:
         resp = requests.post(
             f"{QDRANT_URL}/collections/{req.collection_name}/points/delete",
